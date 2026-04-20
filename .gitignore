@@ -1,4 +1,16 @@
+# Local environments
 .venv/
-__pycache__/
-.ipynb_checkpoints/
 .codex
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Local datasets
+data/
+
+# Local installers / packaged binaries
+*.pyz
