@@ -5,7 +5,13 @@ import jax.tree_util as jtree
 import optax 
 from typing import NamedTuple
 from dln import create_minibatches
-from utils import param_lp_dist, pack_params, unpack_params, param_l2_dist
+from utils import (
+    extrapolated_multiitemp_lambdahat,
+    pack_params,
+    param_l2_dist,
+    param_lp_dist,
+    unpack_params,
+)
 
 class SGLDConfig(NamedTuple):
   epsilon: float
@@ -53,6 +59,7 @@ def run_sgld(rngkey, loss_fn, sgld_config, param_init, x_train, y_train, itemp=N
     sgld_grad_fn = jax.jit(jax.value_and_grad(lambda w, x, y: -local_logprob(w, x, y), argnums=0))
     
     sgldoptim = optim_sgld(sgld_config.epsilon, rngkey)
+    param = param_init
     if compute_mala_acceptance: # For memory efficiency, no need to store if not computing
         old_param = param.copy()
 
@@ -60,7 +67,6 @@ def run_sgld(rngkey, loss_fn, sgld_config, param_init, x_train, y_train, itemp=N
     distances = []
     accept_probs = []
     opt_state = sgldoptim.init(param_init)
-    param = param_init
     t = 0
     while t < sgld_config.num_steps:
         for x_batch, y_batch in create_minibatches(x_train, y_train, batch_size=sgld_config.batch_size):
@@ -106,6 +112,78 @@ def run_sgld(rngkey, loss_fn, sgld_config, param_init, x_train, y_train, itemp=N
             if t >= sgld_config.num_steps:
                 break
     return loss_trace, distances, accept_probs
+
+
+def estimate_learning_coefficient(loss_trace, num_training_data, itemp=None, num_extrapolation=5, burn_in=0):
+    """
+    Estimate the local learning coefficient (RLCT) from an SGLD loss trace.
+
+    Args:
+    loss_trace: Sequence of minibatch/full-batch losses collected during SGLD.
+    num_training_data: Training set size n used to define the inverse temperature.
+    itemp: Inverse temperature used during SGLD. Defaults to 1 / log(n).
+    num_extrapolation: Number of nearby inverse temperatures used for extrapolation.
+    burn_in: Number of initial loss samples to discard before estimating RLCT.
+
+    Returns:
+    float or scipy LinregressResult: Estimated RLCT slope or the full regression result.
+    """
+    if itemp is None:
+        itemp = 1 / jnp.log(num_training_data)
+    losses = jnp.asarray(loss_trace)
+    if burn_in:
+        losses = losses[burn_in:]
+    if losses.size == 0:
+        raise ValueError("loss_trace is empty after burn-in; cannot estimate learning coefficient.")
+    return extrapolated_multiitemp_lambdahat(
+        losses=losses,
+        n=num_training_data,
+        itemp_og=float(itemp),
+        num_extrapolation=num_extrapolation,
+    )
+
+
+def run_sgld_and_estimate_learning_coefficient(
+    rngkey,
+    loss_fn,
+    sgld_config,
+    param_init,
+    x_train,
+    y_train,
+    itemp=None,
+    trace_batch_loss=True,
+    compute_distance=False,
+    compute_mala_acceptance=True,
+    verbose=False,
+    logging_period=200,
+    burn_in=0,
+    num_extrapolation=5,
+):
+    """
+    Convenience wrapper that runs SGLD and estimates the RLCT from its loss trace.
+    """
+    loss_trace, distances, accept_probs = run_sgld(
+        rngkey=rngkey,
+        loss_fn=loss_fn,
+        sgld_config=sgld_config,
+        param_init=param_init,
+        x_train=x_train,
+        y_train=y_train,
+        itemp=itemp,
+        trace_batch_loss=trace_batch_loss,
+        compute_distance=compute_distance,
+        compute_mala_acceptance=compute_mala_acceptance,
+        verbose=verbose,
+        logging_period=logging_period,
+    )
+    learning_coefficient = estimate_learning_coefficient(
+        loss_trace=loss_trace,
+        num_training_data=len(x_train),
+        itemp=itemp,
+        num_extrapolation=num_extrapolation,
+        burn_in=burn_in,
+    )
+    return learning_coefficient, loss_trace, distances, accept_probs
 
 
 def generate_rngkey_tree(key_or_seed, tree_or_treedef):
