@@ -364,7 +364,12 @@ class LocalRLCTTorchEstimator:
                     continue
 
                 indices = rng.choice(dataset_size, size=update_batch_size, replace=replace_batches)
-                index_tensor = torch.as_tensor(indices, dtype=torch.long)
+                first_item = data[0]
+                index_tensor = torch.as_tensor(
+                    indices,
+                    dtype=torch.long,
+                    device=first_item.device,
+                )
                 yield tuple(item.index_select(0, index_tensor) for item in data)
             return
 

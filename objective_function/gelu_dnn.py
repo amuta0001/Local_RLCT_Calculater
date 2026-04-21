@@ -18,16 +18,19 @@ def _build_linear_stack(
 
     for idx in range(len(dims) - 1):
         layers.append(torch.nn.Linear(dims[idx], dims[idx + 1], bias=bias, dtype=dtype))
+        if idx < len(dims) - 2:
+            layers.append(torch.nn.GELU())
 
     return torch.nn.Sequential(*layers)
 
 
 class TrueLinearDNN(torch.nn.Module):
     """
-    Data-generating linear deep neural network.
+    Data-generating GELU network.
 
     This model represents the "true" function used to generate observations.
-    The architecture is a stack of linear layers without nonlinear activations.
+    The architecture is a stack of linear layers with GELU activations between
+    hidden layers.
     """
 
     def __init__(
@@ -79,7 +82,7 @@ class TrueLinearDNN(torch.nn.Module):
 
 class LinearDNNModel(torch.nn.Module):
     """
-    Trainable linear DNN compatible with `common.local_rlct_estimater`.
+    Trainable GELU network compatible with `common.local_rlct_estimater`.
 
     The architecture matches `TrueLinearDNN`, so this model can be trained to
     fit data sampled from the true model while remaining directly usable as a
