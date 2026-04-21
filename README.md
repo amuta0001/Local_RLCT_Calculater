@@ -1,40 +1,38 @@
 # Local_RLCT_Calculater
 
+PyTorch ベースで局所 RLCT を試行的に推定するための実験用リポジトリです。  
+現在は `common/` 配下に共通の推定器を置き、ノートブックから読み込んで検証する構成になっています。
+
 ## ディレクトリ構成
 
-これから作るものの設計図
-
 ```text
 Local_RLCT_Calculater/
-├── README.md                  # プロジェクト概要と使い方
-├── .gitignore         
-├── gpu-test.ipynb             # GPU使用可能確認
-├── local_rlct_estimater.py    # local_rclt推定用のコード  
-├── quadratic_function.py      # 動作確認用の二次関数         
-└── main.ipynb                 # main実行用 
+├── README.md                           # プロジェクト概要
+├──data/
+│   └── mnist/                          # MNIST データ
+├── mnist.ipynb                         # MNIST 関連の実験ノートブック
+├── common/                             # 共通リソース
+│   ├── __init__.py
+│   ├── local_rlct_estimater.py         # 共通の局所 RLCT 推定器
+│   ├── gpu-test.ipynb                  # GPU 利用確認用ノートブック
+│   └── cuda_installer.pyz              # CUDA 関連の補助ファイル
+├── objective_function/                 # 実験用の目的関数モジュール
+│   └── quadratic_function.py           # 二次関数の Torch モデル
+└── ex1_quadratic_function.ipynb        # 二次関数での RLCT 推定実験
 ```
 
+## 使い方
 
+- 共通推定器は `common.local_rlct_estimater` から import します。
+- 二次関数の検証は `ex1_quadratic_function.ipynb` で行います。
+- 実験ノートブックでは、必要に応じて `importlib.reload(...)` で共通モジュールを再読み込みしてください。
 
-### メモ
+例:
 
-必要に応じて、役割ごとにもう少し階層を分けて書くこともできます。
+```python
+from common import local_rlct_estimater
+from objective_function import quadratic_function
 
-```text
-Local_RLCT_Calculater/
-├── src/                       # アプリケーション本体
-│   └── local_rlct_pipeline.py
-├── tests/                     # テストコード
-│   └── test_sgld_torch_local.py
-├── docs/                      # 設計資料・補足ドキュメント
-│   └── local_rlct_design.md
-├── scripts/                   # 実行補助スクリプト
-│   └── training_tasks.py
-└── README.md                  # プロジェクト概要
+LocalRLCTTorchEstimator = local_rlct_estimater.LocalRLCTTorchEstimator
+QuadraticTorchModel = quadratic_function.QuadraticTorchModel
 ```
-
-ポイント:
-
-- ディレクトリ名の右に `#` で役割を書く
-- 深すぎる階層は省略して、重要な部分だけ載せる
-- 実際の配置と README の説明をできるだけ一致させる

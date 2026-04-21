@@ -20,6 +20,8 @@ class RLCTEstimateResult:
     ess_like_counts: np.ndarray
     x0: np.ndarray
     objective_info: dict[str, Any]
+    betaEf_std: np.ndarray | None = None
+    betaEf_se: np.ndarray | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -29,41 +31,13 @@ class LocalRLCTTorchEstimator:
     """
     Estimate a local RLCT around a trained PyTorch model parameter vector.
 
-    The local objective matches the notebook implementation:
+    The local objective is
 
         f(w) = scale * (L_n(w) - L_n(w0))
 
-    where `L_n` is the empirical mean loss over the provided data and `scale`
-    defaults to the number of examples.
-
-    Parameters
-    ----------
-    model:
-        Trained PyTorch model.
-    loss_fn:
-        Callable that returns a scalar tensor. By default it is called as
-        `loss_fn(model, *args, **kwargs)` for each batch.
-    data:
-        Either a tuple like `(x, y)`, a `torch.utils.data.DataLoader`, or any
-        re-iterable collection of batches.
-    w0:
-        Reference parameter vector. If omitted, the model's current parameters
-        are used.
-    device, dtype:
-        Device and dtype used during evaluation. Defaults to the model's first
-        trainable parameter.
-    scale:
-        Multiplicative factor in front of the shifted empirical loss.
-        Defaults to the inferred number of examples.
-    batch_to_args:
-        Optional callable that converts a batch into `(args, kwargs)` used for
-        `loss_fn(model, *args, **kwargs)`.
-    batch_size_fn:
-        Optional callable that returns the number of examples in a batch.
-        Needed only when the size cannot be inferred automatically.
-    eval_mode:
-        If True, the model is switched to evaluation mode while estimating the
-        local RLCT. This is usually desirable for dropout and batch norm.
+    where `L_n` is the empirical mean loss over the evaluation data. Sampling
+    updates are performed with SGLD: gradients are computed on minibatches from
+    `data`, while objective evaluation uses `eval_data` (full data by default).
     """
 
     def __init__(
@@ -79,12 +53,14 @@ class LocalRLCTTorchEstimator:
         batch_to_args: Callable[[Any], BatchArgs] | None = None,
         batch_size_fn: Callable[[Any], int] | None = None,
         eval_mode: bool = True,
+        eval_data: Any | None = None,
     ) -> None:
         self.model = model
         self.loss_fn = loss_fn
         self.batch_to_args = batch_to_args or self._default_batch_to_args
         self.batch_size_fn = batch_size_fn or self._default_batch_size
         self.data = self._prepare_data(data)
+        self.eval_data = self._prepare_data(eval_data if eval_data is not None else data)
         self.eval_mode = eval_mode
 
         self.params = [p for p in self.model.parameters() if p.requires_grad]
@@ -116,7 +92,7 @@ class LocalRLCTTorchEstimator:
             )
 
         self._set_params_from_vector(self.w0_torch)
-        self.dataset_size = self._infer_dataset_size()
+        self.dataset_size = self._infer_dataset_size(self.eval_data)
         self.scale = float(scale) if scale is not None else float(self.dataset_size)
         self.loss0 = self._compute_empirical_loss()
         self.x0 = self.w0_torch.detach().cpu().double().numpy().copy()
@@ -132,9 +108,11 @@ class LocalRLCTTorchEstimator:
         dtype: torch.dtype | None = None,
         scale: float | None = None,
         eval_mode: bool = True,
+        eval_tensors: Sequence[torch.Tensor] | None = None,
     ) -> "LocalRLCTTorchEstimator":
         if not tensors:
             raise ValueError("Please provide at least one tensor.")
+        eval_data = tuple(eval_tensors) if eval_tensors is not None else None
         return cls(
             model=model,
             loss_fn=loss_fn,
@@ -144,6 +122,7 @@ class LocalRLCTTorchEstimator:
             dtype=dtype,
             scale=scale,
             eval_mode=eval_mode,
+            eval_data=eval_data,
         )
 
     def estimate(
@@ -156,64 +135,115 @@ class LocalRLCTTorchEstimator:
         thinning: int = 10,
         clip_radius: float | None = None,
         grad_clip: float | None = None,
+        n_chains: int = 4,
+        max_beta_step: float = 0.25,
+        regression_tail: int | float | None = 0.5,
+        use_weighted_regression: bool = True,
+        update_batch_size: int | None = None,
+        eval_max_batches: int | None = None,
+        replace_batches: bool = True,
         seed: int = 0,
     ) -> RLCTEstimateResult:
         if betas is None:
             betas_array = np.array([8, 16, 32, 64, 128, 256, 512], dtype=float)
         else:
             betas_array = np.asarray(betas, dtype=float)
+        if betas_array.ndim != 1 or betas_array.size < 2:
+            raise ValueError("betas must contain at least two values.")
+        if n_chains < 1:
+            raise ValueError("n_chains must be at least 1.")
+        if n_steps <= burn_in:
+            raise ValueError("n_steps must be greater than burn_in.")
 
         rng = np.random.default_rng(seed)
-        x = self.x0.copy()
-        dim = x.size
+        dim = self.x0.size
+        chain_states = np.repeat(self.x0[None, :], n_chains, axis=0)
+        batch_streams = [
+            self._make_update_batch_stream(
+                self.data,
+                update_batch_size=update_batch_size,
+                replace_batches=replace_batches,
+                rng=np.random.default_rng(rng.integers(0, 2**32)),
+            )
+            for _ in range(n_chains)
+        ]
 
         betaEf_list: list[float] = []
         mean_f_list: list[float] = []
         counts: list[int] = []
+        betaEf_std_list: list[float] = []
+        betaEf_se_list: list[float] = []
 
         try:
             for beta in betas_array:
                 fs: list[float] = []
+                effective_step = min(step_size, max_beta_step / beta)
 
-                for t in range(n_steps):
-                    g = self.grad_f(x)
+                for chain_idx in range(n_chains):
+                    x = chain_states[chain_idx].copy()
+                    batch_stream = batch_streams[chain_idx]
 
-                    if grad_clip is not None:
-                        grad_norm = np.linalg.norm(g)
-                        if grad_norm > grad_clip:
-                            g = g * (grad_clip / (grad_norm + 1e-12))
+                    for t in range(n_steps):
+                        batch = next(batch_stream)
+                        g = self.stochastic_grad_f(x, batch)
 
-                    noise = rng.normal(size=dim)
-                    x = x - step_size * beta * g + np.sqrt(2.0 * step_size) * noise
+                        if grad_clip is not None:
+                            grad_norm = np.linalg.norm(g)
+                            if grad_norm > grad_clip:
+                                g = g * (grad_clip / (grad_norm + 1e-12))
 
-                    if clip_radius is not None:
-                        delta = x - self.x0
-                        delta_norm = np.linalg.norm(delta)
-                        if delta_norm > clip_radius:
-                            x = self.x0 + delta * (clip_radius / (delta_norm + 1e-12))
+                        noise = rng.normal(size=dim)
+                        x = x - effective_step * beta * g + np.sqrt(2.0 * effective_step) * noise
 
-                    if t >= burn_in and ((t - burn_in) % thinning == 0):
-                        fs.append(float(self.f(x)))
+                        if clip_radius is not None:
+                            delta = x - self.x0
+                            delta_norm = np.linalg.norm(delta)
+                            if delta_norm > clip_radius:
+                                x = self.x0 + delta * (clip_radius / (delta_norm + 1e-12))
+
+                        if t >= burn_in and ((t - burn_in) % thinning == 0):
+                            fs.append(float(self.f(x, max_batches=eval_max_batches)))
+
+                    chain_states[chain_idx] = x
 
                 samples = np.asarray(fs, dtype=float)
+                if samples.size == 0:
+                    raise ValueError("No post-burn-in samples collected. Adjust n_steps, burn_in, or thinning.")
+
                 mean_f = float(samples.mean())
                 betaEf = float(beta * mean_f)
+                betaEf_std = float(beta * samples.std(ddof=1)) if samples.size > 1 else 0.0
+                betaEf_se = float(betaEf_std / np.sqrt(samples.size)) if samples.size > 0 else 0.0
 
                 mean_f_list.append(mean_f)
                 betaEf_list.append(betaEf)
                 counts.append(len(samples))
+                betaEf_std_list.append(betaEf_std)
+                betaEf_se_list.append(betaEf_se)
         finally:
             self._set_params_from_vector(self.w0_torch)
             self.model.train(self.was_training)
 
+        betaEf_arr = np.asarray(betaEf_list, dtype=float)
+        betaEf_se_arr = np.asarray(betaEf_se_list, dtype=float)
+        regression_mask = self._build_regression_mask(betas_array, regression_tail)
         z = 1.0 / np.log(betas_array)
         design = np.column_stack([np.ones_like(z), z])
-        coef, *_ = np.linalg.lstsq(design, np.asarray(betaEf_list), rcond=None)
+        design_used = design[regression_mask]
+        response_used = betaEf_arr[regression_mask]
+
+        if use_weighted_regression:
+            weights = 1.0 / np.maximum(betaEf_se_arr[regression_mask] ** 2, 1e-12)
+            sqrt_weights = np.sqrt(weights)
+            design_used = design_used * sqrt_weights[:, None]
+            response_used = response_used * sqrt_weights
+
+        coef, *_ = np.linalg.lstsq(design_used, response_used, rcond=None)
 
         return RLCTEstimateResult(
             lambda_hat=float(coef[0]),
             betas=betas_array,
-            betaEf=np.asarray(betaEf_list, dtype=float),
+            betaEf=betaEf_arr,
             mean_f=np.asarray(mean_f_list, dtype=float),
             ess_like_counts=np.asarray(counts, dtype=int),
             x0=self.x0.copy(),
@@ -225,19 +255,44 @@ class LocalRLCTTorchEstimator:
                 "dtype": str(self.dtype),
                 "num_params": int(self.x0.size),
                 "eval_mode": self.eval_mode,
+                "sampler": "sgld",
+                "n_chains": n_chains,
+                "base_step_size": step_size,
+                "max_beta_step": max_beta_step,
+                "update_batch_size": update_batch_size,
+                "eval_max_batches": eval_max_batches,
+                "replace_batches": replace_batches,
+                "regression_tail": regression_tail,
+                "use_weighted_regression": use_weighted_regression,
+                "regression_betas": betas_array[regression_mask].copy(),
             },
+            betaEf_std=np.asarray(betaEf_std_list, dtype=float),
+            betaEf_se=betaEf_se_arr,
         )
 
-    def f(self, w: np.ndarray | torch.Tensor) -> float:
+    def f(
+        self,
+        w: np.ndarray | torch.Tensor,
+        *,
+        max_batches: int | None = None,
+        data: Any | None = None,
+    ) -> float:
         w_vec = self._to_parameter_vector(w)
         self._set_params_from_vector(w_vec)
-        loss_value = self._compute_empirical_loss()
+        loss_value = self._compute_empirical_loss(data=data, max_batches=max_batches)
         return self.scale * (loss_value - self.loss0)
 
     def grad_f(self, w: np.ndarray | torch.Tensor) -> np.ndarray:
         w_vec = self._to_parameter_vector(w)
         self._set_params_from_vector(w_vec)
+        return self._gradient_from_batches(self._iter_batches(self.eval_data))
 
+    def stochastic_grad_f(self, w: np.ndarray | torch.Tensor, batch: Any) -> np.ndarray:
+        w_vec = self._to_parameter_vector(w)
+        self._set_params_from_vector(w_vec)
+        return self._gradient_from_batches([batch])
+
+    def _gradient_from_batches(self, batches: Sequence[Any] | Iterator[Any]) -> np.ndarray:
         for param in self.params:
             if param.grad is not None:
                 param.grad.zero_()
@@ -245,7 +300,7 @@ class LocalRLCTTorchEstimator:
         total_weight = 0.0
         weighted_loss: torch.Tensor | None = None
 
-        for batch in self._iter_batches():
+        for batch in batches:
             args, kwargs = self._move_batch_to_device(batch)
             batch_loss = self.loss_fn(self.model, *args, **kwargs)
             if batch_loss.ndim != 0:
@@ -259,8 +314,8 @@ class LocalRLCTTorchEstimator:
         if weighted_loss is None or total_weight == 0.0:
             raise ValueError("No data available to compute the empirical gradient.")
 
-        empirical_mean_loss = weighted_loss / total_weight
-        objective = self.scale * (empirical_mean_loss - self.loss0)
+        mean_loss = weighted_loss / total_weight
+        objective = self.scale * mean_loss
         grads = torch.autograd.grad(objective, self.params, allow_unused=False)
         grad_vec = parameters_to_vector([grad.detach() for grad in grads])
         return grad_vec.cpu().double().numpy()
@@ -278,42 +333,78 @@ class LocalRLCTTorchEstimator:
             "data must be a tensor tuple, DataLoader, or another re-iterable collection."
         )
 
-    def _iter_batches(self) -> Iterator[Any]:
-        if isinstance(self.data, tuple) and self.data and all(
-            torch.is_tensor(item) for item in self.data
-        ):
-            yield self.data
-            return
-        yield from self.data
+    def _iter_batches(self, data: Any, max_batches: int | None = None) -> Iterator[Any]:
+        yielded = 0
 
-    def _infer_dataset_size(self) -> int:
-        if hasattr(self.data, "dataset"):
+        if isinstance(data, tuple) and data and all(torch.is_tensor(item) for item in data):
+            if max_batches is None or max_batches > 0:
+                yield data
+            return
+
+        for batch in data:
+            yield batch
+            yielded += 1
+            if max_batches is not None and yielded >= max_batches:
+                break
+
+    def _make_update_batch_stream(
+        self,
+        data: Any,
+        *,
+        update_batch_size: int | None,
+        replace_batches: bool,
+        rng: np.random.Generator,
+    ) -> Iterator[Any]:
+        if self._is_tensor_tuple(data):
+            dataset_size = self._infer_dataset_size(data)
+
+            while True:
+                if update_batch_size is None or update_batch_size >= dataset_size:
+                    yield data
+                    continue
+
+                indices = rng.choice(dataset_size, size=update_batch_size, replace=replace_batches)
+                index_tensor = torch.as_tensor(indices, dtype=torch.long)
+                yield tuple(item.index_select(0, index_tensor) for item in data)
+            return
+
+        while True:
+            for batch in data:
+                yield batch
+
+    def _infer_dataset_size(self, data: Any) -> int:
+        if hasattr(data, "dataset"):
             try:
-                size = len(self.data.dataset)
+                size = len(data.dataset)
                 if size > 0:
                     return int(size)
             except TypeError:
                 pass
 
-        if isinstance(self.data, tuple) and self.data and all(
-            torch.is_tensor(item) for item in self.data
-        ):
-            return int(self.batch_size_fn(self.data))
+        if self._is_tensor_tuple(data):
+            return int(self.batch_size_fn(data))
 
         total = 0
-        for batch in self._iter_batches():
+        for batch in self._iter_batches(data):
             total += int(self.batch_size_fn(batch))
 
         if total <= 0:
             raise ValueError("Could not infer dataset size. Please provide batch_size_fn or scale.")
         return total
 
-    def _compute_empirical_loss(self) -> float:
+    def _compute_empirical_loss(
+        self,
+        *,
+        data: Any | None = None,
+        max_batches: int | None = None,
+    ) -> float:
+        data = self.eval_data if data is None else self._prepare_data(data)
+
         with torch.no_grad():
             total_weight = 0.0
             total_loss = 0.0
 
-            for batch in self._iter_batches():
+            for batch in self._iter_batches(data, max_batches=max_batches):
                 args, kwargs = self._move_batch_to_device(batch)
                 batch_loss = self.loss_fn(self.model, *args, **kwargs)
                 if batch_loss.ndim != 0:
@@ -346,6 +437,30 @@ class LocalRLCTTorchEstimator:
     def _set_params_from_vector(self, w_vec: torch.Tensor) -> None:
         with torch.no_grad():
             vector_to_parameters(w_vec, self.params)
+
+    @staticmethod
+    def _build_regression_mask(
+        betas: np.ndarray, regression_tail: int | float | None
+    ) -> np.ndarray:
+        if regression_tail is None:
+            return np.ones_like(betas, dtype=bool)
+
+        n_betas = betas.size
+        if isinstance(regression_tail, float):
+            if not 0.0 < regression_tail <= 1.0:
+                raise ValueError("regression_tail as a float must lie in (0, 1].")
+            tail_count = max(2, int(np.ceil(n_betas * regression_tail)))
+        else:
+            tail_count = max(2, int(regression_tail))
+
+        tail_count = min(n_betas, tail_count)
+        mask = np.zeros(n_betas, dtype=bool)
+        mask[-tail_count:] = True
+        return mask
+
+    @staticmethod
+    def _is_tensor_tuple(data: Any) -> bool:
+        return isinstance(data, tuple) and data and all(torch.is_tensor(item) for item in data)
 
     @staticmethod
     def _default_batch_to_args(batch: Any) -> BatchArgs:
