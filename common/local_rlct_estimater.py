@@ -27,6 +27,29 @@ class RLCTEstimateResult:
         return asdict(self)
 
 
+@dataclass
+class NeighborhoodGapSearchResult:
+    max_gap: float
+    max_gap_sample_index: int
+    max_gap_parameter: np.ndarray
+    train_loss_at_max_gap: float
+    test_loss_at_max_gap: float
+    sampled_gaps: np.ndarray
+    sampled_train_losses: np.ndarray
+    sampled_test_losses: np.ndarray
+    sampled_distances: np.ndarray
+    radius: float
+    n_samples: int
+    include_center: bool
+    absolute_gap: bool
+    distribution: str
+    seed: int
+    x0: np.ndarray
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 class LocalRLCTTorchEstimator:
     """
     Estimate a local RLCT around a trained PyTorch model parameter vector.
@@ -546,3 +569,145 @@ def estimate_local_rlct(
         w0=w0,
     )
     return estimator.estimate(**estimate_kwargs)
+
+
+def find_max_generalization_gap_in_neighborhood(
+    model: torch.nn.Module,
+    loss_fn: Callable[..., torch.Tensor],
+    train_data: Any,
+    test_data: Any,
+    w0: torch.Tensor | np.ndarray | None = None,
+    *,
+    radius: float = 1e-2,
+    n_samples: int = 256,
+    distribution: str = "sphere",
+    include_center: bool = True,
+    absolute_gap: bool = True,
+    device: torch.device | str | None = None,
+    dtype: torch.dtype | None = None,
+    batch_to_args: Callable[[Any], BatchArgs] | None = None,
+    batch_size_fn: Callable[[Any], int] | None = None,
+    eval_mode: bool = True,
+    seed: int = 0,
+) -> NeighborhoodGapSearchResult:
+    """
+    Search for the largest generalization gap in a neighborhood around `w0`.
+
+    The search is Monte Carlo based: parameter vectors are sampled within the
+    Euclidean ball of radius `radius` centered at `w0`, the train/test losses
+    are evaluated at each sample, and the maximum gap is returned.
+
+    Args:
+        model: Target PyTorch model.
+        loss_fn: Scalar loss function with signature compatible with
+            `LocalRLCTTorchEstimator`.
+        train_data: Data used to compute the training loss.
+        test_data: Data used to compute the test loss.
+        w0: Center parameter vector. If omitted, the current model parameters
+            are used.
+        radius: Radius of the search neighborhood in parameter space.
+        n_samples: Number of perturbed samples to evaluate.
+        distribution: `"sphere"` for uniform samples in the Euclidean ball or
+            `"gaussian"` for isotropic Gaussian perturbations rescaled so that
+            the typical perturbation norm is about `radius`.
+        include_center: Whether to include `w0` itself as sample index 0.
+        absolute_gap: If True, use `abs(test_loss - train_loss)`.
+        device, dtype, batch_to_args, batch_size_fn, eval_mode: Same meaning as
+            in `LocalRLCTTorchEstimator`.
+        seed: RNG seed for reproducible sampling.
+    """
+    if radius < 0.0:
+        raise ValueError("radius must be non-negative.")
+    if n_samples < 1:
+        raise ValueError("n_samples must be at least 1.")
+    if distribution not in {"sphere", "gaussian"}:
+        raise ValueError("distribution must be one of {'sphere', 'gaussian'}.")
+
+    estimator = LocalRLCTTorchEstimator(
+        model=model,
+        loss_fn=loss_fn,
+        data=train_data,
+        w0=w0,
+        device=device,
+        dtype=dtype,
+        batch_to_args=batch_to_args,
+        batch_size_fn=batch_size_fn,
+        eval_mode=eval_mode,
+        eval_data=train_data,
+    )
+
+    rng = np.random.default_rng(seed)
+    dim = estimator.x0.size
+    sampled_params: list[np.ndarray] = []
+
+    if include_center:
+        sampled_params.append(estimator.x0.copy())
+
+    remaining = n_samples - len(sampled_params)
+    for _ in range(remaining):
+        if distribution == "sphere":
+            direction = rng.normal(size=dim)
+            norm = np.linalg.norm(direction)
+            if norm == 0.0:
+                direction = np.zeros(dim, dtype=float)
+            else:
+                direction = direction / norm
+            scaled_radius = radius * (rng.random() ** (1.0 / max(dim, 1)))
+            candidate = estimator.x0 + scaled_radius * direction
+        else:
+            direction = rng.normal(size=dim)
+            norm = np.linalg.norm(direction)
+            if norm == 0.0:
+                candidate = estimator.x0.copy()
+            else:
+                candidate = estimator.x0 + (radius / np.sqrt(max(dim, 1))) * direction
+        sampled_params.append(candidate.astype(float, copy=False))
+
+    train_losses: list[float] = []
+    test_losses: list[float] = []
+    gaps: list[float] = []
+    distances: list[float] = []
+
+    try:
+        for sample in sampled_params:
+            sample_vec = estimator._to_parameter_vector(sample)
+            estimator._set_params_from_vector(sample_vec)
+            train_loss = estimator._compute_empirical_loss(data=train_data)
+            test_loss = estimator._compute_empirical_loss(data=test_data)
+            gap = test_loss - train_loss
+            if absolute_gap:
+                gap = abs(gap)
+
+            train_losses.append(float(train_loss))
+            test_losses.append(float(test_loss))
+            gaps.append(float(gap))
+            distances.append(float(np.linalg.norm(sample - estimator.x0)))
+    finally:
+        estimator._set_params_from_vector(estimator.w0_torch)
+        estimator.model.train(estimator.was_training)
+
+    gaps_arr = np.asarray(gaps, dtype=float)
+    train_arr = np.asarray(train_losses, dtype=float)
+    test_arr = np.asarray(test_losses, dtype=float)
+    distances_arr = np.asarray(distances, dtype=float)
+    sample_arr = np.asarray(sampled_params, dtype=float)
+
+    max_index = int(np.argmax(gaps_arr))
+    return NeighborhoodGapSearchResult(
+        max_gap=float(gaps_arr[max_index]),
+        max_gap_sample_index=max_index,
+        max_gap_parameter=sample_arr[max_index].copy(),
+        train_loss_at_max_gap=float(train_arr[max_index]),
+        test_loss_at_max_gap=float(test_arr[max_index]),
+        sampled_gaps=gaps_arr,
+        sampled_train_losses=train_arr,
+        sampled_test_losses=test_arr,
+        sampled_distances=distances_arr,
+        radius=float(radius),
+        n_samples=int(n_samples),
+        include_center=bool(include_center),
+        absolute_gap=bool(absolute_gap),
+        distribution=distribution,
+        seed=int(seed),
+        x0=estimator.x0.copy(),
+    )
