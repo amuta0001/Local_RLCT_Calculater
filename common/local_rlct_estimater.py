@@ -54,6 +54,7 @@ class LocalRLCTTorchEstimator:
         batch_size_fn: Callable[[Any], int] | None = None,
         eval_mode: bool = True,
         eval_data: Any | None = None,
+        log_output_mode: str = "none",
     ) -> None:
         self.model = model
         self.loss_fn = loss_fn
@@ -62,6 +63,7 @@ class LocalRLCTTorchEstimator:
         self.data = self._prepare_data(data)
         self.eval_data = self._prepare_data(eval_data if eval_data is not None else data)
         self.eval_mode = eval_mode
+        self.log_output_mode = self._validate_log_output_mode(log_output_mode)
 
         self.params = [p for p in self.model.parameters() if p.requires_grad]
         if not self.params:
@@ -109,6 +111,7 @@ class LocalRLCTTorchEstimator:
         scale: float | None = None,
         eval_mode: bool = True,
         eval_tensors: Sequence[torch.Tensor] | None = None,
+        log_output_mode: str = "none",
     ) -> "LocalRLCTTorchEstimator":
         if not tensors:
             raise ValueError("Please provide at least one tensor.")
@@ -123,6 +126,7 @@ class LocalRLCTTorchEstimator:
             scale=scale,
             eval_mode=eval_mode,
             eval_data=eval_data,
+            log_output_mode=log_output_mode,
         )
 
     def estimate(
@@ -143,7 +147,10 @@ class LocalRLCTTorchEstimator:
         eval_max_batches: int | None = None,
         replace_batches: bool = True,
         seed: int = 0,
+        log_output_mode: str | None = None,
+        log_every: int = 100,
     ) -> RLCTEstimateResult:
+        log_mode = self.log_output_mode if log_output_mode is None else self._validate_log_output_mode(log_output_mode)
         if betas is None:
             betas_array = np.array([8, 16, 32, 64, 128, 256, 512], dtype=float)
         else:
@@ -178,6 +185,11 @@ class LocalRLCTTorchEstimator:
             for beta in betas_array:
                 fs: list[float] = []
                 effective_step = min(step_size, max_beta_step / beta)
+                if log_mode in {"beta", "step"}:
+                    print(
+                        f"[LocalRLCT] beta={beta:.6g} start "
+                        f"(effective_step={effective_step:.6g}, n_chains={n_chains})"
+                    )
 
                 for chain_idx in range(n_chains):
                     x = chain_states[chain_idx].copy()
@@ -204,6 +216,16 @@ class LocalRLCTTorchEstimator:
                         if t >= burn_in and ((t - burn_in) % thinning == 0):
                             fs.append(float(self.f(x, max_batches=eval_max_batches)))
 
+                        if (
+                            log_mode == "step"
+                            and ((t + 1) % log_every == 0 or t + 1 == n_steps)
+                        ):
+                            samples_so_far = max(0, ((t - burn_in) // thinning) + 1) if t >= burn_in else 0
+                            print(
+                                f"[LocalRLCT] beta={beta:.6g} chain={chain_idx + 1}/{n_chains} "
+                                f"step={t + 1}/{n_steps} samples={samples_so_far}"
+                            )
+
                     chain_states[chain_idx] = x
 
                 samples = np.asarray(fs, dtype=float)
@@ -220,6 +242,11 @@ class LocalRLCTTorchEstimator:
                 counts.append(len(samples))
                 betaEf_std_list.append(betaEf_std)
                 betaEf_se_list.append(betaEf_se)
+                if log_mode in {"beta", "step"}:
+                    print(
+                        f"[LocalRLCT] beta={beta:.6g} done "
+                        f"(samples={len(samples)}, mean_f={mean_f:.6g}, betaEf={betaEf:.6g})"
+                    )
         finally:
             self._set_params_from_vector(self.w0_torch)
             self.model.train(self.was_training)
@@ -264,6 +291,8 @@ class LocalRLCTTorchEstimator:
                 "replace_batches": replace_batches,
                 "regression_tail": regression_tail,
                 "use_weighted_regression": use_weighted_regression,
+                "log_output_mode": log_mode,
+                "log_every": log_every,
                 "regression_betas": betas_array[regression_mask].copy(),
             },
             betaEf_std=np.asarray(betaEf_std_list, dtype=float),
@@ -462,6 +491,15 @@ class LocalRLCTTorchEstimator:
         mask = np.zeros(n_betas, dtype=bool)
         mask[-tail_count:] = True
         return mask
+
+    @staticmethod
+    def _validate_log_output_mode(mode: str) -> str:
+        valid_modes = {"none", "beta", "step"}
+        if mode not in valid_modes:
+            raise ValueError(
+                f"log_output_mode must be one of {sorted(valid_modes)}, got {mode!r}."
+            )
+        return mode
 
     @staticmethod
     def _is_tensor_tuple(data: Any) -> bool:
