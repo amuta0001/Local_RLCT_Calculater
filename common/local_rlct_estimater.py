@@ -28,6 +28,20 @@ class RLCTEstimateResult:
 
 
 @dataclass
+class SGLDAcceptanceDiagnosticResult:
+    betas: np.ndarray
+    effective_step_sizes: np.ndarray
+    mean_acceptance_rates: np.ndarray
+    acceptance_rate_std: np.ndarray
+    sample_counts: np.ndarray
+    x0: np.ndarray
+    objective_info: dict[str, Any]
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class NeighborhoodGapSearchResult:
     max_gap: float
     max_gap_sample_index: int
@@ -322,6 +336,181 @@ class LocalRLCTTorchEstimator:
             betaEf_se=betaEf_se_arr,
         )
 
+    def diagnose_mala_acceptance(
+        self,
+        *,
+        betas: Sequence[float] | None = None,
+        step_size: float = 1e-3,
+        n_steps: int = 400,
+        burn_in: int = 100,
+        check_interval: int = 1,
+        clip_radius: float | None = None,
+        grad_clip: float | None = None,
+        n_chains: int = 2,
+        max_beta_step: float = 0.25,
+        update_batch_size: int | None = None,
+        replace_batches: bool = True,
+        eval_max_batches: int | None = None,
+        seed: int = 0,
+        log_output_mode: str | None = None,
+        log_every: int = 100,
+    ) -> SGLDAcceptanceDiagnosticResult:
+        """
+        Diagnose the SGLD step size with a MALA-style acceptance rate.
+
+        SGLD itself accepts every proposal, so there is no literal acceptance
+        rate inside the algorithm. We therefore reuse the same proposal and ask:
+        "if this were corrected into MALA, how often would the move be accepted?"
+        A rate near 1.0 usually means the step is very conservative, while a
+        much smaller rate suggests the proposal is too aggressive.
+        """
+        log_mode = self.log_output_mode if log_output_mode is None else self._validate_log_output_mode(log_output_mode)
+        if betas is None:
+            betas_array = np.array([8, 16, 32, 64], dtype=float)
+        else:
+            betas_array = np.asarray(betas, dtype=float)
+        if betas_array.ndim != 1 or betas_array.size < 1:
+            raise ValueError("betas must contain at least one value.")
+        if n_chains < 1:
+            raise ValueError("n_chains must be at least 1.")
+        if n_steps <= burn_in:
+            raise ValueError("n_steps must be greater than burn_in.")
+        if check_interval < 1:
+            raise ValueError("check_interval must be at least 1.")
+
+        rng = np.random.default_rng(seed)
+        dim = self.x0.size
+        chain_states = np.repeat(self.x0[None, :], n_chains, axis=0)
+        batch_streams = [
+            self._make_update_batch_stream(
+                self.data,
+                update_batch_size=update_batch_size,
+                replace_batches=replace_batches,
+                rng=np.random.default_rng(rng.integers(0, 2**32)),
+            )
+            for _ in range(n_chains)
+        ]
+
+        mean_acceptance_list: list[float] = []
+        acceptance_std_list: list[float] = []
+        sample_counts: list[int] = []
+        effective_steps: list[float] = []
+
+        try:
+            for beta in betas_array:
+                effective_step = min(step_size, max_beta_step / beta)
+                effective_steps.append(float(effective_step))
+                acceptance_rates: list[float] = []
+
+                if log_mode in {"beta", "step"}:
+                    print(
+                        f"[LocalRLCT] beta={beta:.6g} acceptance diagnostic start "
+                        f"(effective_step={effective_step:.6g}, n_chains={n_chains})"
+                    )
+
+                for chain_idx in range(n_chains):
+                    x = chain_states[chain_idx].copy()
+                    batch_stream = batch_streams[chain_idx]
+
+                    for t in range(n_steps):
+                        batch = next(batch_stream)
+                        g = self.stochastic_grad_f(x, batch)
+
+                        if grad_clip is not None:
+                            grad_norm = np.linalg.norm(g)
+                            if grad_norm > grad_clip:
+                                g = g * (grad_clip / (grad_norm + 1e-12))
+
+                        noise = rng.normal(size=dim)
+                        proposal = x - effective_step * beta * g + np.sqrt(2.0 * effective_step) * noise
+
+                        if clip_radius is not None:
+                            delta = proposal - self.x0
+                            delta_norm = np.linalg.norm(delta)
+                            if delta_norm > clip_radius:
+                                proposal = self.x0 + delta * (clip_radius / (delta_norm + 1e-12))
+
+                        acceptance_probability = self._mala_acceptance_probability(
+                            x,
+                            proposal,
+                            beta=beta,
+                            step_size=effective_step,
+                            max_batches=eval_max_batches,
+                        )
+                        should_record = (
+                            t >= burn_in
+                            and ((t - burn_in) % check_interval == 0)
+                        )
+                        if should_record:
+                            acceptance_rates.append(float(acceptance_probability))
+
+                        x = proposal
+
+                        if (
+                            log_mode == "step"
+                            and ((t + 1) % log_every == 0 or t + 1 == n_steps)
+                        ):
+                            samples_so_far = max(0, t + 1 - burn_in)
+                            print(
+                                f"[LocalRLCT] beta={beta:.6g} chain={chain_idx + 1}/{n_chains} "
+                                f"diagnostic_step={t + 1}/{n_steps} acceptance_samples={samples_so_far}"
+                            )
+
+                    chain_states[chain_idx] = x
+
+                acceptance_array = np.asarray(acceptance_rates, dtype=float)
+                if acceptance_array.size == 0:
+                    raise ValueError("No post-burn-in diagnostic samples collected.")
+
+                mean_acceptance = float(acceptance_array.mean())
+                acceptance_std = (
+                    float(acceptance_array.std(ddof=1))
+                    if acceptance_array.size > 1
+                    else 0.0
+                )
+
+                mean_acceptance_list.append(mean_acceptance)
+                acceptance_std_list.append(acceptance_std)
+                sample_counts.append(int(acceptance_array.size))
+
+                if log_mode in {"beta", "step"}:
+                    print(
+                        f"[LocalRLCT] beta={beta:.6g} acceptance diagnostic done "
+                        f"(samples={acceptance_array.size}, mean_acceptance={mean_acceptance:.4f})"
+                    )
+        finally:
+            self._set_params_from_vector(self.w0_torch)
+            self.model.train(self.was_training)
+
+        return SGLDAcceptanceDiagnosticResult(
+            betas=betas_array,
+            effective_step_sizes=np.asarray(effective_steps, dtype=float),
+            mean_acceptance_rates=np.asarray(mean_acceptance_list, dtype=float),
+            acceptance_rate_std=np.asarray(acceptance_std_list, dtype=float),
+            sample_counts=np.asarray(sample_counts, dtype=int),
+            x0=self.x0.copy(),
+            objective_info={
+                "loss0": self.loss0,
+                "scale": self.scale,
+                "dataset_size": self.dataset_size,
+                "device": str(self.device),
+                "dtype": str(self.dtype),
+                "num_params": int(self.x0.size),
+                "eval_mode": self.eval_mode,
+                "sampler": "sgld",
+                "diagnostic": "mala_acceptance_probability",
+                "n_chains": n_chains,
+                "base_step_size": step_size,
+                "max_beta_step": max_beta_step,
+                "check_interval": check_interval,
+                "update_batch_size": update_batch_size,
+                "eval_max_batches": eval_max_batches,
+                "replace_batches": replace_batches,
+                "log_output_mode": log_mode,
+                "log_every": log_every,
+            },
+        )
+
     def f(
         self,
         w: np.ndarray | torch.Tensor,
@@ -494,6 +683,34 @@ class LocalRLCTTorchEstimator:
     def _set_params_from_vector(self, w_vec: torch.Tensor) -> None:
         with torch.no_grad():
             vector_to_parameters(w_vec, self.params)
+
+    def _mala_acceptance_probability(
+        self,
+        current: np.ndarray,
+        proposal: np.ndarray,
+        *,
+        beta: float,
+        step_size: float,
+        max_batches: int | None = None,
+    ) -> float:
+        current = np.asarray(current, dtype=float)
+        proposal = np.asarray(proposal, dtype=float)
+
+        current_f = self.f(current, max_batches=max_batches)
+        proposal_f = self.f(proposal, max_batches=max_batches)
+        current_grad = self.grad_f(current)
+        proposal_grad = self.grad_f(proposal)
+
+        forward_mean = current - step_size * beta * current_grad
+        reverse_mean = proposal - step_size * beta * proposal_grad
+
+        log_target_ratio = -beta * (proposal_f - current_f)
+        log_q_reverse_minus_forward = (
+            -np.sum((current - reverse_mean) ** 2) / (4.0 * step_size)
+            + np.sum((proposal - forward_mean) ** 2) / (4.0 * step_size)
+        )
+        log_acceptance_ratio = log_target_ratio + log_q_reverse_minus_forward
+        return float(np.exp(min(0.0, log_acceptance_ratio)))
 
     @staticmethod
     def _build_regression_mask(
